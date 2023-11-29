@@ -7,3 +7,4 @@ pandas==2.1.3
 praatio==6.1.0
 nltk==3.8.1
 sox==1.4.1
+numpy

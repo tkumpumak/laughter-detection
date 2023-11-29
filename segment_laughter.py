@@ -13,6 +13,7 @@ from tqdm import tqdm
 from torch import optim, nn
 from functools import partial
 from distutils.util import strtobool
+import prob_conditioner
 
 
 def main():
@@ -24,12 +25,14 @@ def main():
         "--model_path", type=str, default="checkpoints/in_use/resnet_with_augmentation"
     )
     parser.add_argument("--config", type=str, default="resnet_with_augmentation")
-    parser.add_argument("--threshold", type=str, default="0.5")
-    parser.add_argument("--min_length", type=str, default="0.2")
+    parser.add_argument("--threshold", type=str, default="0.8")
+    parser.add_argument("--cutoff_threshold", type=str, default="0.25")
+    parser.add_argument("--min_length", type=str, default="0.5")
     parser.add_argument("--input_audio_file", required=True, type=str)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--save_to_audio_files", type=str, default="True")
     parser.add_argument("--save_to_textgrid", type=str, default="False")
+    parser.add_argument("--all_channels", type=str, default="False")
 
     args = parser.parse_args()
 
@@ -37,9 +40,11 @@ def main():
     config = configs.CONFIG_MAP[args.config]
     audio_path = args.input_audio_file
     threshold = float(args.threshold)
+    cutoff_threshold = float(args.threshold)
     min_length = float(args.min_length)
     save_to_audio_files = bool(strtobool(args.save_to_audio_files))
     save_to_textgrid = bool(strtobool(args.save_to_textgrid))
+    all_channels = bool(strtobool(args.all_channels))
     output_dir = args.output_dir
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,43 +68,63 @@ def main():
 
     ##### Load the audio file and features
 
-    inference_dataset = data_loaders.SwitchBoardLaughterInferenceDataset(
-        audio_path=audio_path, feature_fn=feature_fn, sr=sample_rate
-    )
-
-    collate_fn = partial(
-        audio_utils.pad_sequences_with_labels,
-        expand_channel_dim=config["expand_channel_dim"],
-    )
-
-    inference_generator = torch.utils.data.DataLoader(
-        inference_dataset,
-        num_workers=4,
-        batch_size=8,
-        shuffle=False,
-        collate_fn=collate_fn,
-    )
-
-    ##### Make Predictions
-
-    probs = []
-    for model_inputs, _ in tqdm(inference_generator):
-        x = torch.from_numpy(model_inputs).float().to(device)
-        preds = model(x).cpu().detach().numpy().squeeze()
-        if len(preds.shape) == 0:
-            preds = [float(preds)]
+    channels = 1
+    if all_channels:
+        channels, sr = librosa.load(audio_path, sr=8000, mono=False)
+        if len(channels.shape) == 1:
+            channels = 1
         else:
-            preds = list(preds)
-        probs += preds
-    probs = np.array(probs)
+            channels = channels.shape[0]
 
-    file_length = audio_utils.get_audio_length(audio_path)
+    combined_probs = np.zeros(0)
+    for ch in range(channels):
+        print("Processing channel " + str(ch + 1) + " of " + str(channels))
+        inference_dataset = data_loaders.SwitchBoardLaughterInferenceDataset(
+            audio_path=audio_path, feature_fn=feature_fn, sr=sample_rate, channel=ch + 1
+        )
+
+        collate_fn = partial(
+            audio_utils.pad_sequences_with_labels,
+            expand_channel_dim=config["expand_channel_dim"],
+        )
+
+        inference_generator = torch.utils.data.DataLoader(
+            inference_dataset,
+            num_workers=4,
+            batch_size=16,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
+
+        ##### Make Predictions
+
+        probs = []
+        for model_inputs, _ in tqdm(inference_generator):
+            x = torch.from_numpy(model_inputs).float().to(device)
+            preds = model(x).cpu().detach().numpy().squeeze()
+            if len(preds.shape) == 0:
+                preds = [float(preds)]
+            else:
+                preds = list(preds)
+            probs += preds
+        probs = np.array(probs)
+
+        if len(combined_probs) == 0:
+            combined_probs = probs.copy()
+        else:
+            combined_probs = np.maximum(combined_probs, probs)
+    probs = combined_probs
+
+    file_length = len(inference_dataset.y) / sample_rate
 
     fps = len(probs) / float(file_length)
 
-    probs = laugh_segmenter.lowpass(probs)
+    convprobs = prob_conditioner.condition_propabilities(
+        probs, threshold, cutoff_threshold, fps
+    )
+
     instances = laugh_segmenter.get_laughter_instances(
-        probs, threshold=threshold, min_length=float(args.min_length), fps=fps
+        convprobs, threshold=threshold, min_length=float(args.min_length), fps=fps
     )
 
     print("")
